@@ -47,6 +47,8 @@
 #include "no_os_spi.h"
 #include "no_os_gpio.h"
 #include "no_os_delay.h"
+
+
 #ifdef XILINX_PLATFORM
 #include <xparameters.h>
 #include <xil_cache.h>
@@ -58,6 +60,8 @@
 #include "altera_gpio.h"
 #endif
 #endif
+
+
 #ifdef LINUX_PLATFORM
 #include "linux_spi.h"
 #include "linux_gpio.h"
@@ -215,8 +219,8 @@ AD9361_InitParam default_init_param = {
 	0,		//ensm_enable_pin_pulse_mode_enable *** adi,ensm-enable-pin-pulse-mode-enable
 	0,		//ensm_enable_txnrx_control_enable *** adi,ensm-enable-txnrx-control-enable
 	/* LO Control */
-	2400000000UL,	//rx_synthesizer_frequency_hz *** adi,rx-synthesizer-frequency-hz
-	2400000000UL,	//tx_synthesizer_frequency_hz *** adi,tx-synthesizer-frequency-hz
+	2400000000UL,	//rx_synthesizer_frequency_hz *** adi,rx-synthesizer-frequency-hz  /* to be changed later */
+	2400000000UL,	//tx_synthesizer_frequency_hz *** adi,tx-synthesizer-frequency-hz  /* to be changed later */
 	1,				//tx_lo_powerdown_managed_enable *** adi,tx-lo-powerdown-managed-enable
 	/* Rate & BW Control */
 	{983040000, 245760000, 122880000, 61440000, 61440000, 61440000},// rx_path_clock_frequencies[6] *** adi,rx-path-clock-frequencies
@@ -230,12 +234,12 @@ AD9361_InitParam default_init_param = {
 	10000,	//tx_attenuation_mdB *** adi,tx-attenuation-mdB
 	0,		//update_tx_gain_in_alert_enable *** adi,update-tx-gain-in-alert-enable
 	/* Reference Clock Control */
-	0,		//xo_disable_use_ext_refclk_enable *** adi,xo-disable-use-ext-refclk-enable
+	0,		//xo_disable_use_ext_refclk_enable *** adi,xo-disable-use-ext-refclk-enable /* to be changed later */
 	{8, 5920},	//dcxo_coarse_and_fine_tune[2] *** adi,dcxo-coarse-and-fine-tune
 	CLKOUT_DISABLE,	//clk_output_mode_select *** adi,clk-output-mode-select
 	/* Gain Control */
-	2,		//gc_rx1_mode *** adi,gc-rx1-mode
-	2,		//gc_rx2_mode *** adi,gc-rx2-mode
+	2,		//gc_rx1_mode *** adi,gc-rx1-mode /* to be changed later */
+	2,		//gc_rx2_mode *** adi,gc-rx2-mode /* to be changed later */
 	58,		//gc_adc_large_overload_thresh *** adi,gc-adc-large-overload-thresh
 	4,		//gc_adc_ovr_sample_size *** adi,gc-adc-ovr-sample-size
 	47,		//gc_adc_small_overload_thresh *** adi,gc-adc-small-overload-thresh
@@ -367,10 +371,10 @@ AD9361_InitParam default_init_param = {
 	0,		//full_port_enable *** adi,full-port-enable
 	0,		//full_duplex_swap_bits_enable *** adi,full-duplex-swap-bits-enable
 	0,		//delay_rx_data *** adi,delay-rx-data
-	0,		//rx_data_clock_delay *** adi,rx-data-clock-delay
-	4,		//rx_data_delay *** adi,rx-data-delay
-	7,		//tx_fb_clock_delay *** adi,tx-fb-clock-delay
-	0,		//tx_data_delay *** adi,tx-data-delay
+	8,		//rx_data_clock_delay *** adi,rx-data-clock-delay
+	8,		//rx_data_delay *** adi,rx-data-delay
+	8,		//tx_fb_clock_delay *** adi,tx-fb-clock-delay
+	8,		//tx_data_delay *** adi,tx-data-delay
 #ifdef ALTERA_PLATFORM
 	300,	//lvds_bias_mV *** adi,lvds-bias-mV
 #else
@@ -517,19 +521,201 @@ struct ad9361_rf_phy *ad9361_phy_b;
 #endif
 
 
+#define SLAVE_N_RX_CHAN 4
+#define PN_SETTLE_US 2000
+#define MAX_ATTEMPTS 10
+
+
+
+/**
+ * Reads and prints the current RX/TX clock and data delay taps
+ * for both master and slave devices.
+ */
+void print_delay_taps(struct ad9361_rf_phy *phy_master,
+                               struct ad9361_rf_phy *phy_slave)
+{
+    uint8_t rx_master, tx_master, rx_slave, tx_slave;
+
+    // Read registers
+    rx_master = ad9361_spi_read(phy_master->spi, REG_RX_CLOCK_DATA_DELAY);
+    tx_master = ad9361_spi_read(phy_master->spi, REG_TX_CLOCK_DATA_DELAY);
+    rx_slave  = ad9361_spi_read(phy_slave->spi, REG_RX_CLOCK_DATA_DELAY);
+    tx_slave  = ad9361_spi_read(phy_slave->spi, REG_TX_CLOCK_DATA_DELAY);
+
+    // Print formatted output
+    printf("  master current taps: RX clk=%u data=%u  TX clk=%u data=%u\n"
+           "  slave current taps: RX clk=%u data=%u  TX clk=%u data=%u\n",
+           (rx_master >> 4) & 0xF, rx_master & 0xF,
+           (tx_master >> 4) & 0xF, tx_master & 0xF,
+           (rx_slave >> 4) & 0xF,  rx_slave & 0xF,
+           (tx_slave >> 4) & 0xF,  tx_slave & 0xF
+    );
+}
+
+
+
+/*
+ * Clear W1C status bits, wait, re-read, and report whether either
+ * slave RX channel has PN_ERR or PN_OOS latched.
+ * Returns 0 if clean, non-zero bitmask if any channel is bad.
+ */
+static uint32_t slave_link_status(struct axi_adc *slave_adc, int verbose)
+{
+    uint32_t status;
+    uint32_t bad = 0;
+    int c;
+
+    for (c = 0; c < SLAVE_N_RX_CHAN; c++)
+        axi_adc_write(slave_adc, AXI_ADC_REG_CHAN_STATUS(c),
+                      AXI_ADC_PN_ERR | AXI_ADC_PN_OOS | AXI_ADC_OVER_RANGE);
+
+    no_os_udelay(PN_SETTLE_US);
+
+    for (c = 0; c < SLAVE_N_RX_CHAN; c++) {
+        axi_adc_read(slave_adc, AXI_ADC_REG_CHAN_STATUS(c), &status);
+        if (verbose)
+            printf("  slave ch%d status=0x%08lx%s%s%s\n",
+                   c, (unsigned long)status,
+                   (status & AXI_ADC_PN_ERR)    ? " PN_ERR" : "",
+                   (status & AXI_ADC_PN_OOS)    ? " PN_OOS" : "",
+                   (status & AXI_ADC_OVER_RANGE)? " OVR"    : "");
+        if (status & (AXI_ADC_PN_ERR | AXI_ADC_PN_OOS))
+            bad |= (1u << c);
+    }
+    return bad;
+}
+
+/*
+ * Put slave in PRBS, read axi_adc channel status, disable BIST.
+ */
+static uint32_t slave_link_probe_with_prbs(struct ad9361_rf_phy *phy_slave,
+                                           int verbose)
+{
+    uint32_t bad;
+
+    ad9361_bist_prbs(phy_slave, BIST_INJ_RX);
+    no_os_udelay(500);                          /* let PRBS propagate */
+    bad = slave_link_status(phy_slave->rx_adc, verbose);
+    ad9361_bist_prbs(phy_slave, BIST_DISABLE);
+    return bad;
+}
+
+/*
+ * Public entry point.
+ * Returns 0 on clean slave link (possibly after re-tuning), -1 on giveup.
+ */
+int fmcomms5_verify_slave_link(struct ad9361_rf_phy *phy_master,
+                               struct ad9361_rf_phy *phy_slave)
+{
+    int attempt;
+    uint32_t bad;
+
+    for (attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        printf("\n[fmcomms5] slave link check, attempt %d/%d\n",
+               attempt, MAX_ATTEMPTS);
+
+        bad = slave_link_probe_with_prbs(phy_slave, 1);
+        if (bad == 0) {
+            printf("[fmcomms5] slave link CLEAN.\n");
+
+            print_delay_taps(phy_master, phy_slave);
+
+            return 0;
+        }
+
+
+
+        printf("[fmcomms5] slave link BAD. Eye at failure (pre-MCS):\n");
+
+        print_delay_taps(phy_master, phy_slave);
+
+
+		printf("\ntune ad9361 slave.\n");
+		ad9361_dig_tune(phy_slave, 0, BE_VERBOSE);
+
+//		printf("\ntune ad9361 master.\n");
+//		ad9361_dig_tune(phy_slave, 0, BE_VERBOSE);
+//		ad9361_dig_tune(phy_master, 0, BE_VERBOSE);
+
+
+
+
+
+        bad = slave_link_probe_with_prbs(phy_slave, 1);
+        if (bad == 0) {
+            printf("[fmcomms5] slave link CLEAN.\n");
+
+            print_delay_taps(phy_master, phy_slave);
+
+            return 0;
+        }
+
+
+    }
+
+    printf("[fmcomms5] FATAL: slave link still bad after %d attempts.\n",
+           MAX_ATTEMPTS);
+    return -1;
+}
+
+static void print_reg_binary(const char *label, uint16_t addr, int32_t val)
+{
+    uint8_t v = (uint8_t)(val & 0xFF);
+    printf("%s (0x%03x): 0x%02x = ", label, addr, v);
+    for (int i = 7; i >= 0; i--) {
+        printf("%d", (v >> i) & 1);
+        if (i == 4) printf(" ");   // space between nibbles for readability
+    }
+    printf("\n");
+}
+
+void print_register_values(struct ad9361_rf_phy *phy_master, struct ad9361_rf_phy *phy_slave)
+{
+    print_reg_binary("slave  tx filter", REG_TX_ENABLE_FILTER_CTRL, ad9361_spi_read(phy_slave->spi,  REG_TX_ENABLE_FILTER_CTRL));
+    print_reg_binary("master tx filter", REG_TX_ENABLE_FILTER_CTRL, ad9361_spi_read(phy_master->spi, REG_TX_ENABLE_FILTER_CTRL));
+
+    print_reg_binary("slave  rx filter", REG_RX_ENABLE_FILTER_CTRL, ad9361_spi_read(phy_slave->spi,  REG_RX_ENABLE_FILTER_CTRL));
+    print_reg_binary("master rx filter", REG_RX_ENABLE_FILTER_CTRL, ad9361_spi_read(phy_master->spi, REG_RX_ENABLE_FILTER_CTRL));
+
+    print_reg_binary("slave input select", REG_INPUT_SELECT, ad9361_spi_read(phy_slave->spi,  REG_INPUT_SELECT));
+    print_reg_binary("master input select", REG_INPUT_SELECT, ad9361_spi_read(phy_master->spi,  REG_INPUT_SELECT));
+
+    print_reg_binary("slave rfpll dividers", REG_RFPLL_DIVIDERS, ad9361_spi_read(phy_slave->spi,  REG_RFPLL_DIVIDERS));
+    print_reg_binary("master rfpll dividers", REG_RFPLL_DIVIDERS, ad9361_spi_read(phy_master->spi,  REG_RFPLL_DIVIDERS));
+
+    print_reg_binary("slave dcxo clock enable", REG_CLOCK_ENABLE, ad9361_spi_read(phy_slave->spi,  REG_CLOCK_ENABLE));
+    print_reg_binary("master dcxo clock enable", REG_CLOCK_ENABLE, ad9361_spi_read(phy_master->spi,  REG_CLOCK_ENABLE));
+
+    print_reg_binary("slave bbpll", REG_BBPLL, ad9361_spi_read(phy_slave->spi,  REG_BBPLL));
+    print_reg_binary("master bbpll", REG_BBPLL, ad9361_spi_read(phy_master->spi,  REG_BBPLL));
+
+    print_reg_binary("slave bbpll integer BB freq word", REG_INTEGER_BB_FREQ_WORD, ad9361_spi_read(phy_slave->spi,  REG_INTEGER_BB_FREQ_WORD));
+    print_reg_binary("master bbpll integer BB freq word", REG_INTEGER_BB_FREQ_WORD, ad9361_spi_read(phy_master->spi,  REG_INTEGER_BB_FREQ_WORD));
+
+    print_reg_binary("slave bbpll BB frac word 1", REG_FRACT_BB_FREQ_WORD_1, ad9361_spi_read(phy_slave->spi,  REG_FRACT_BB_FREQ_WORD_1));
+    print_reg_binary("master bbpll BB frac word 1", REG_FRACT_BB_FREQ_WORD_1, ad9361_spi_read(phy_master->spi,  REG_FRACT_BB_FREQ_WORD_1));
+
+    print_reg_binary("slave bbpll BB frac word 2", REG_FRACT_BB_FREQ_WORD_2, ad9361_spi_read(phy_slave->spi,  REG_FRACT_BB_FREQ_WORD_2));
+    print_reg_binary("master bbpll BB frac word 2", REG_FRACT_BB_FREQ_WORD_2, ad9361_spi_read(phy_master->spi,  REG_FRACT_BB_FREQ_WORD_2));
+
+    print_reg_binary("slave bbpll BB frac word 3", REG_FRACT_BB_FREQ_WORD_3, ad9361_spi_read(phy_slave->spi,  REG_FRACT_BB_FREQ_WORD_3));
+    print_reg_binary("master bbpll BB frac word 3", REG_FRACT_BB_FREQ_WORD_3, ad9361_spi_read(phy_master->spi,  REG_FRACT_BB_FREQ_WORD_3));
+}
+
 
 /***************************************************************************//**
  * @brief main
 *******************************************************************************/
 int main(void)
 {
-	int32_t status;
+
 #ifdef XILINX_PLATFORM
 	Xil_ICacheEnable();
 	Xil_DCacheEnable();
 	default_init_param.spi_param.extra = &xil_spi_param;
 	default_init_param.spi_param.platform_ops = &xil_spi_ops;
 #endif
+
 
 #ifdef ALTERA_PLATFORM
 	default_init_param.spi_param.platform_ops = &altera_spi_ops;
@@ -540,9 +726,26 @@ int main(void)
 	}
 #endif
 
+
+	int32_t status;
+	uint32_t sampling_freq_hz = 61440000;
+
+
 	// NOTE: The user has to choose the GPIO numbers according to desired
 	// carrier board.
 	default_init_param.gpio_resetb.number = GPIO_RESET_PIN;
+
+	default_init_param.rx_synthesizer_frequency_hz = 1090000000UL;
+	default_init_param.tx_synthesizer_frequency_hz = 2400000000UL;
+
+	default_init_param.digital_interface_tune_skip_mode = 0;
+
+	default_init_param.gc_rx1_mode = 0;
+	default_init_param.gc_rx2_mode = 0;
+	default_init_param.external_tx_lo_enable = 0;
+	default_init_param.external_rx_lo_enable = 0;
+	default_init_param.two_t_two_r_timing_enable = 1;
+
 
 #ifdef FMCOMMS5
 	default_init_param.gpio_sync.number = GPIO_SYNC_PIN;
@@ -575,6 +778,11 @@ int main(void)
 
 	ad9361_init(&ad9361_phy, &default_init_param);
 
+
+//	ad9361_tx_mute(ad9361_phy, 1);
+	ad9361_set_rx_sampling_freq(ad9361_phy, sampling_freq_hz);
+	ad9361_set_rx_rf_gain(ad9361_phy, 0, 20);
+	ad9361_set_rx_rf_gain(ad9361_phy, 1, 20);
 	ad9361_set_tx_fir_config(ad9361_phy, tx_fir_config);
 	ad9361_set_rx_fir_config(ad9361_phy, rx_fir_config);
 
@@ -590,18 +798,23 @@ int main(void)
 	default_init_param.gpio_sync.number = -1;
 	default_init_param.gpio_cal_sw1.number = -1;
 	default_init_param.gpio_cal_sw2.number = -1;
-	default_init_param.rx_synthesizer_frequency_hz = 2300000000UL;
-	default_init_param.tx_synthesizer_frequency_hz = 2300000000UL;
+//	default_init_param.rx_synthesizer_frequency_hz = 1090000000UL;
+//	default_init_param.tx_synthesizer_frequency_hz = 2400000000UL;
 
 	rx_adc_init.base = AD9361_RX_1_BASEADDR;
 	rx_adc_init.num_slave_channels = 0;
 	tx_dac_init.base = AD9361_TX_1_BASEADDR;
 
+
 	ad9361_init(&ad9361_phy_b, &default_init_param);
 
+
+//	ad9361_tx_mute(ad9361_phy_b, 1);
+	ad9361_set_rx_sampling_freq(ad9361_phy_b, sampling_freq_hz);
+	ad9361_set_rx_rf_gain(ad9361_phy_b, 0, 1);
+	ad9361_set_rx_rf_gain(ad9361_phy_b, 1, 1);
 	ad9361_set_tx_fir_config(ad9361_phy_b, tx_fir_config);
 	ad9361_set_rx_fir_config(ad9361_phy_b, rx_fir_config);
-
 #endif
 	status = axi_dmac_init(&tx_dmac, &tx_dmac_init);
 	if (status < 0) {
@@ -648,6 +861,38 @@ int main(void)
 
 #ifdef FMCOMMS5
 	ad9361_do_mcs(ad9361_phy, ad9361_phy_b);
+
+
+//	ad9361_dig_tune(ad9361_phy, 0, BE_MOREVERBOSE);
+//	ad9361_dig_tune(ad9361_phy_b, 0, BE_MOREVERBOSE);
+
+
+
+
+
+
+
+	if (fmcomms5_verify_slave_link(ad9361_phy, ad9361_phy_b) != 0)	{return -1;}
+
+	print_register_values(ad9361_phy, ad9361_phy_b);
+
+
+	ad9361_bist_tone(ad9361_phy, BIST_INJ_RX, 0x03, 0, 0x00);
+	ad9361_bist_tone(ad9361_phy_b, BIST_INJ_RX, 0x03, 6, 0x00);
+
+	uint32_t rx_sample_rate_phy   = ad9361_phy->clks[RX_SAMPL_CLK]->rate;
+	uint32_t rx_sample_rate_phy_b = ad9361_phy_b->clks[RX_SAMPL_CLK]->rate;
+	printf("sdr 1 rx sample rate: %d\n", rx_sample_rate_phy);
+	printf("sdr 2 rx sample rate: %d\n", rx_sample_rate_phy_b);
+
+
+
+//	int32_t reg1 = ad9361_spi_read(ad9361_phy_b->spi, REG_BIST_AND_DATA_PORT_TEST_CONFIG);
+//	int32_t reg2 = ad9361_spi_read(ad9361_phy_b->spi, REG_BIST_CONFIG);
+//	printf("REG_BIST_AND_DATA_PORT_TEST_CONFIG: %"PRIi32"\n", reg1);
+//	printf("REG_BIST_CONFIG: %"PRIi32"\n", reg2);
+
+
 
 #endif
 
@@ -975,6 +1220,7 @@ int main(void)
 #endif // IIO_SUPPORT
 
 	printf("Done.\n");
+	while(1){}
 
 #ifdef TDD_SWITCH_STATE_EXAMPLE
 	uint32_t ensm_mode;
